@@ -1,0 +1,95 @@
+const express = require('express');
+const { pool } = require('../db');
+const { authMiddleware, clubAdminUp } = require('../middleware');
+const router = express.Router();
+
+function scopeFilter(user) {
+  // Returns WHERE clause additions and params based on user role
+  if (user.role === 'sa_admin') return { clause: '', params: [] };
+  if (user.role === 'union_admin') return { clause: ' AND p.union_id = $ROLE_PARAM', roleVal: user.union_id };
+  if (user.role === 'club_admin') return { clause: ' AND p.club_id = $ROLE_PARAM', roleVal: user.club_id };
+  return { clause: ' AND p.user_id = $ROLE_PARAM', roleVal: user.id }; // player sees own record
+}
+
+router.get('/', authMiddleware, async (req, res) => {
+  const { union_id, club_id, gender, age_group } = req.query;
+  try {
+    let where = 'WHERE p.active = true';
+    const params = [];
+
+    if (req.user.role === 'union_admin' && req.user.union_id) { params.push(req.user.union_id); where += ` AND p.union_id = $${params.length}`; }
+    if (req.user.role === 'club_admin' && req.user.club_id)   { params.push(req.user.club_id);  where += ` AND p.club_id = $${params.length}`; }
+    if (req.user.role === 'player') { params.push(req.user.id); where += ` AND p.user_id = $${params.length}`; }
+
+    if (union_id) { params.push(union_id); where += ` AND p.union_id = $${params.length}`; }
+    if (club_id)  { params.push(club_id);  where += ` AND p.club_id = $${params.length}`; }
+    if (gender)   { params.push(gender);   where += ` AND p.gender = $${params.length}`; }
+    if (age_group){ params.push(age_group);where += ` AND p.age_group = $${params.length}`; }
+
+    const result = await pool.query(`
+      SELECT p.*, u.name as union_name, c.name as club_name
+      FROM players p
+      LEFT JOIN unions u ON u.id = p.union_id
+      LEFT JOIN clubs c ON c.id = p.club_id
+      ${where}
+      ORDER BY p.name ASC`, params);
+    res.json(result.rows);
+  } catch (err) { console.error(err); res.status(500).json({ error: 'Server error' }); }
+});
+
+router.get('/:id', authMiddleware, async (req, res) => {
+  try {
+    const player = await pool.query(`
+      SELECT p.*, u.name as union_name, c.name as club_name
+      FROM players p
+      LEFT JOIN unions u ON u.id = p.union_id
+      LEFT JOIN clubs c ON c.id = p.club_id
+      WHERE p.id = $1`, [req.params.id]);
+    if (!player.rows.length) return res.status(404).json({ error: 'Player not found' });
+
+    const stats = await pool.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE mp.is_winner = true) as wins,
+        COUNT(*) FILTER (WHERE mp.is_winner = false AND m.is_draw = false) as losses,
+        COUNT(*) FILTER (WHERE m.is_draw = true) as draws,
+        COUNT(*) as total_matches
+      FROM match_players mp JOIN matches m ON mp.match_id = m.id
+      WHERE mp.player_id = $1`, [req.params.id]);
+
+    res.json({ ...player.rows[0], stats: stats.rows[0] });
+  } catch (err) { res.status(500).json({ error: 'Server error' }); }
+});
+
+router.post('/', authMiddleware, clubAdminUp, async (req, res) => {
+  const { name, gender, age_group, category, email, dob, union_id, club_id, user_id } = req.body;
+  if (!name || !gender || !age_group || !category) return res.status(400).json({ error: 'Required fields missing' });
+
+  const effectiveUnionId = req.user.role === 'union_admin' ? req.user.union_id : (union_id || null);
+  const effectiveClubId  = req.user.role === 'club_admin'  ? req.user.club_id  : (club_id  || null);
+
+  try {
+    const result = await pool.query(
+      'INSERT INTO players (name, gender, age_group, category, email, dob, union_id, club_id, user_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
+      [name, gender, age_group, category, email || null, dob || null, effectiveUnionId, effectiveClubId, user_id || null]);
+    res.status(201).json(result.rows[0]);
+  } catch (err) { console.error(err); res.status(500).json({ error: 'Server error' }); }
+});
+
+router.put('/:id', authMiddleware, clubAdminUp, async (req, res) => {
+  const { name, gender, age_group, category, email, dob, union_id, club_id } = req.body;
+  try {
+    const result = await pool.query(
+      'UPDATE players SET name=$1, gender=$2, age_group=$3, category=$4, email=$5, dob=$6, union_id=$7, club_id=$8 WHERE id=$9 RETURNING *',
+      [name, gender, age_group, category, email || null, dob || null, union_id || null, club_id || null, req.params.id]);
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: 'Server error' }); }
+});
+
+router.delete('/:id', authMiddleware, clubAdminUp, async (req, res) => {
+  try {
+    await pool.query('UPDATE players SET active=false WHERE id=$1', [req.params.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Server error' }); }
+});
+
+module.exports = router;
