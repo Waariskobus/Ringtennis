@@ -1,0 +1,107 @@
+const express = require('express');
+const { pool } = require('../db');
+const { authMiddleware, saAdminOnly, unionAdminUp } = require('../middleware');
+const router = express.Router();
+
+// ── UNIONS ────────────────────────────────────────────
+
+router.get('/unions', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT u.*, COUNT(DISTINCT c.id) as club_count, COUNT(DISTINCT p.id) as player_count
+      FROM unions u
+      LEFT JOIN clubs c ON c.union_id = u.id AND c.active = true
+      LEFT JOIN players p ON p.union_id = u.id AND p.active = true
+      GROUP BY u.id ORDER BY u.name`);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: 'Server error' }); }
+});
+
+router.post('/unions', authMiddleware, saAdminOnly, async (req, res) => {
+  const { name, province, contact_name, contact_email } = req.body;
+  if (!name) return res.status(400).json({ error: 'Name required' });
+  try {
+    const result = await pool.query(
+      'INSERT INTO unions (name, province, contact_name, contact_email) VALUES ($1,$2,$3,$4) RETURNING *',
+      [name, province || null, contact_name || null, contact_email || null]);
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'Union already exists' });
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.put('/unions/:id', authMiddleware, saAdminOnly, async (req, res) => {
+  const { name, province, contact_name, contact_email, active } = req.body;
+  try {
+    const result = await pool.query(
+      'UPDATE unions SET name=$1, province=$2, contact_name=$3, contact_email=$4, active=$5 WHERE id=$6 RETURNING *',
+      [name, province || null, contact_name || null, contact_email || null, active !== false, req.params.id]);
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: 'Server error' }); }
+});
+
+router.delete('/unions/:id', authMiddleware, saAdminOnly, async (req, res) => {
+  try {
+    await pool.query('UPDATE unions SET active=false WHERE id=$1', [req.params.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── CLUBS ─────────────────────────────────────────────
+
+router.get('/clubs', authMiddleware, async (req, res) => {
+  const { union_id } = req.query;
+  try {
+    let q = `SELECT c.*, u.name as union_name, COUNT(DISTINCT p.id) as player_count
+             FROM clubs c
+             LEFT JOIN unions u ON u.id = c.union_id
+             LEFT JOIN players p ON p.club_id = c.id AND p.active = true
+             WHERE c.active = true`;
+    const params = [];
+    if (union_id) { params.push(union_id); q += ` AND c.union_id = $${params.length}`; }
+    // Union admins see only their union's clubs
+    if (req.user.role === 'union_admin' && req.user.union_id) {
+      params.push(req.user.union_id); q += ` AND c.union_id = $${params.length}`;
+    }
+    // Club admins see only their club
+    if (req.user.role === 'club_admin' && req.user.club_id) {
+      params.push(req.user.club_id); q += ` AND c.id = $${params.length}`;
+    }
+    q += ' GROUP BY c.id, u.name ORDER BY c.name';
+    const result = await pool.query(q, params);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: 'Server error' }); }
+});
+
+router.post('/clubs', authMiddleware, async (req, res) => {
+  if (!['sa_admin','union_admin'].includes(req.user.role)) return res.status(403).json({ error: 'Access denied' });
+  const { name, union_id, contact_name, contact_email } = req.body;
+  if (!name || !union_id) return res.status(400).json({ error: 'Name and union required' });
+  const effectiveUnionId = req.user.role === 'union_admin' ? req.user.union_id : union_id;
+  try {
+    const result = await pool.query(
+      'INSERT INTO clubs (name, union_id, contact_name, contact_email) VALUES ($1,$2,$3,$4) RETURNING *',
+      [name, effectiveUnionId, contact_name || null, contact_email || null]);
+    res.status(201).json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: 'Server error' }); }
+});
+
+router.put('/clubs/:id', authMiddleware, unionAdminUp, async (req, res) => {
+  const { name, union_id, contact_name, contact_email, active } = req.body;
+  try {
+    const result = await pool.query(
+      'UPDATE clubs SET name=$1, union_id=$2, contact_name=$3, contact_email=$4, active=$5 WHERE id=$6 RETURNING *',
+      [name, union_id, contact_name || null, contact_email || null, active !== false, req.params.id]);
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: 'Server error' }); }
+});
+
+router.delete('/clubs/:id', authMiddleware, unionAdminUp, async (req, res) => {
+  try {
+    await pool.query('UPDATE clubs SET active=false WHERE id=$1', [req.params.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Server error' }); }
+});
+
+module.exports = router;
