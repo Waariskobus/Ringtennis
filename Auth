@@ -1,0 +1,68 @@
+const express = require('express');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { pool } = require('../db');
+const { authMiddleware } = require('../middleware');
+const router = express.Router();
+
+const VALID_ROLES = ['player', 'club_admin', 'union_admin', 'sa_admin'];
+
+router.post('/register', async (req, res) => {
+  const { name, email, password, role, union_id, club_id } = req.body;
+  if (!name || !email || !password) return res.status(400).json({ error: 'All fields required' });
+  const userRole = VALID_ROLES.includes(role) ? role : 'player';
+  // sa_admin cannot self-register
+  if (userRole === 'sa_admin') return res.status(403).json({ error: 'SA Admin accounts must be created by existing admins' });
+  try {
+    const hash = await bcrypt.hash(password, 10);
+    const result = await pool.query(
+      'INSERT INTO users (name, email, password_hash, role, union_id, club_id) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, name, email, role, union_id, club_id',
+      [name, email.toLowerCase(), hash, userRole, union_id || null, club_id || null]
+    );
+    const user = result.rows[0];
+    const token = jwt.sign({ id: user.id, name: user.name, email: user.email, role: user.role, union_id: user.union_id, club_id: user.club_id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, user });
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'Email already registered' });
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.post('/login', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+  try {
+    const result = await pool.query(
+      `SELECT u.*, un.name as union_name, c.name as club_name
+       FROM users u
+       LEFT JOIN unions un ON un.id = u.union_id
+       LEFT JOIN clubs c ON c.id = u.club_id
+       WHERE u.email = $1`, [email.toLowerCase()]);
+    const user = result.rows[0];
+    if (!user) return res.status(401).json({ error: 'Invalid email or password' });
+    const valid = await bcrypt.compare(password, user.password_hash);
+    if (!valid) return res.status(401).json({ error: 'Invalid email or password' });
+    const token = jwt.sign({ id: user.id, name: user.name, email: user.email, role: user.role, union_id: user.union_id, club_id: user.club_id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role, union_id: user.union_id, club_id: user.club_id, union_name: user.union_name, club_name: user.club_name } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.get('/me', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT u.id, u.name, u.email, u.role, u.union_id, u.club_id, u.created_at,
+              un.name as union_name, c.name as club_name
+       FROM users u
+       LEFT JOIN unions un ON un.id = u.union_id
+       LEFT JOIN clubs c ON c.id = u.club_id
+       WHERE u.id = $1`, [req.user.id]);
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+module.exports = router;
