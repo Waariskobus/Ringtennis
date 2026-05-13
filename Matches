@@ -1,0 +1,127 @@
+const express = require('express');
+const { pool } = require('../db');
+const { authMiddleware, clubAdminUp } = require('../middleware');
+const router = express.Router();
+
+router.get('/', authMiddleware, async (req, res) => {
+  const { union_id, club_id } = req.query;
+  try {
+    let where = 'WHERE 1=1';
+    const params = [];
+
+    if (req.user.role === 'union_admin' && req.user.union_id) { params.push(req.user.union_id); where += ` AND m.union_id = $${params.length}`; }
+    if (req.user.role === 'club_admin'  && req.user.club_id)  { params.push(req.user.club_id);  where += ` AND m.club_id = $${params.length}`; }
+    if (req.user.role === 'player') {
+      params.push(req.user.id);
+      where += ` AND m.id IN (SELECT match_id FROM match_players mp2 JOIN players pl ON pl.id = mp2.player_id WHERE pl.user_id = $${params.length})`;
+    }
+    if (union_id) { params.push(union_id); where += ` AND m.union_id = $${params.length}`; }
+    if (club_id)  { params.push(club_id);  where += ` AND m.club_id = $${params.length}`; }
+
+    const result = await pool.query(`
+      SELECT m.*,
+        un.name as union_name, c.name as club_name,
+        json_agg(json_build_object(
+          'player_id', mp.player_id, 'player_name', p.name,
+          'side', mp.side, 'is_winner', mp.is_winner
+        ) ORDER BY mp.side, p.name) AS participants
+      FROM matches m
+      LEFT JOIN unions un ON un.id = m.union_id
+      LEFT JOIN clubs c ON c.id = m.club_id
+      LEFT JOIN match_players mp ON mp.match_id = m.id
+      LEFT JOIN players p ON p.id = mp.player_id
+      ${where}
+      GROUP BY m.id, un.name, c.name
+      ORDER BY m.match_date DESC, m.created_at DESC`, params);
+    res.json(result.rows);
+  } catch (err) { console.error(err); res.status(500).json({ error: 'Server error' }); }
+});
+
+router.post('/', authMiddleware, clubAdminUp, async (req, res) => {
+  const { match_type, match_date, round, score1, score2, notes, players, union_id, club_id, is_forfeit } = req.body;
+  if (!match_type || !match_date || score1 === undefined || score2 === undefined || !players?.length)
+    return res.status(400).json({ error: 'Required fields missing' });
+
+  const effectiveUnionId = req.user.role === 'union_admin' ? req.user.union_id : (union_id || null);
+  const effectiveClubId  = req.user.role === 'club_admin'  ? req.user.club_id  : (club_id  || null);
+  const is_draw = score1 === score2;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const matchResult = await client.query(
+      'INSERT INTO matches (match_type, match_date, round, score1, score2, is_draw, is_forfeit, notes, logged_by, union_id, club_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
+      [match_type, match_date, round || null, score1, score2, is_draw, is_forfeit || false, notes || null, req.user.id, effectiveUnionId, effectiveClubId]);
+    const match = matchResult.rows[0];
+
+    for (const p of players) {
+      let is_winner = false;
+      if (!is_draw) {
+        if ((p.side === '1' || p.side === 'A') && score1 > score2) is_winner = true;
+        if ((p.side === '2' || p.side === 'B') && score2 > score1) is_winner = true;
+      }
+      await client.query('INSERT INTO match_players (match_id, player_id, side, is_winner) VALUES ($1,$2,$3,$4)',
+        [match.id, p.player_id, p.side, is_winner]);
+    }
+    await client.query('COMMIT');
+
+    const full = await pool.query(`
+      SELECT m.*, un.name as union_name, c.name as club_name,
+        json_agg(json_build_object('player_id',mp.player_id,'player_name',p.name,'side',mp.side,'is_winner',mp.is_winner) ORDER BY mp.side,p.name) AS participants
+      FROM matches m
+      LEFT JOIN unions un ON un.id=m.union_id LEFT JOIN clubs c ON c.id=m.club_id
+      LEFT JOIN match_players mp ON mp.match_id=m.id LEFT JOIN players p ON p.id=mp.player_id
+      WHERE m.id=$1 GROUP BY m.id,un.name,c.name`, [match.id]);
+    res.status(201).json(full.rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err); res.status(500).json({ error: 'Server error' });
+  } finally { client.release(); }
+});
+
+router.delete('/:id', authMiddleware, clubAdminUp, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM matches WHERE id=$1', [req.params.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Server error' }); }
+});
+
+router.get('/rankings/summary', authMiddleware, async (req, res) => {
+  const { union_id, club_id, match_type } = req.query;
+  try {
+    let where = 'WHERE p.active = true';
+    const params = [];
+
+    if (req.user.role === 'union_admin' && req.user.union_id) { params.push(req.user.union_id); where += ` AND p.union_id = $${params.length}`; }
+    if (req.user.role === 'club_admin'  && req.user.club_id)  { params.push(req.user.club_id);  where += ` AND p.club_id = $${params.length}`; }
+    if (union_id) { params.push(union_id); where += ` AND p.union_id = $${params.length}`; }
+    if (club_id)  { params.push(club_id);  where += ` AND p.club_id = $${params.length}`; }
+
+    let matchWhere = '';
+    if (match_type && match_type !== 'all') {
+      if (match_type === 'Dubbels') { params.push('%Dubbels%'); matchWhere = ` AND m.match_type LIKE $${params.length}`; }
+      else { params.push(match_type); matchWhere = ` AND m.match_type = $${params.length}`; }
+    }
+
+    const result = await pool.query(`
+      SELECT p.id, p.name, p.gender, p.age_group, p.category,
+        u.name as union_name, c.name as club_name,
+        COUNT(mp.id) as total_matches,
+        COUNT(mp.id) FILTER (WHERE mp.is_winner=true) as wins,
+        COUNT(mp.id) FILTER (WHERE mp.is_winner=false AND m.is_draw=false) as losses,
+        COUNT(mp.id) FILTER (WHERE m.is_draw=true) as draws,
+        COUNT(mp.id) FILTER (WHERE mp.is_winner=true)*3 + COUNT(mp.id) FILTER (WHERE m.is_draw=true) as points,
+        COALESCE(SUM(CASE WHEN mp.side IN ('1','A') THEN m.score1-m.score2 ELSE m.score2-m.score1 END),0) as point_diff
+      FROM players p
+      LEFT JOIN unions u ON u.id=p.union_id
+      LEFT JOIN clubs c ON c.id=p.club_id
+      LEFT JOIN match_players mp ON mp.player_id=p.id
+      LEFT JOIN matches m ON m.id=mp.match_id ${matchWhere}
+      ${where}
+      GROUP BY p.id, u.name, c.name
+      ORDER BY points DESC, wins DESC`, params);
+    res.json(result.rows);
+  } catch (err) { console.error(err); res.status(500).json({ error: 'Server error' }); }
+});
+
+module.exports = router;
